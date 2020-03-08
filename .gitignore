@@ -1,0 +1,7 @@
+#Any child directory of an MPLABX project folder - if folder structure changed later, modify this
+*.X/*/
+
+#Negate folders inside MPLABX project folders that you would like to be versioned
+
+*.[oa]
+*~
