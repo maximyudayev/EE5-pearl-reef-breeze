@@ -7,22 +7,31 @@
 ;		   but with different register names, values, filters, etc.
 ; Dependencies:    Header (p18f25k50.inc)
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-; Author		Date	    Version	    Comment
+; Author		Date	    Version	Comment
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-; Maxim Yudayev		08/03/2020  0.1		    -Verified in Debug mode
-;						     correct CAN controller setup
+; Maxim Yudayev		08/03/2020  0.1		-Verified in Debug mode:
+;						  *correct CAN controller setup
+;						  *correct TX buffer loading and
+;						   request to send
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-; TODO			Date        Finished	    Comment
+; TODO			Date        Finished	Comment
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ; -Add #define driven	08/03/2020  
 ;  masks/filters and
 ;  transmit priorities
 ;  for use by SolarTeam
 ;  as API
+; -Adjust ORGs at the	08/03/2020
+;  completion of
+;  program creation to
+;  minmize jumps and to
+;  replace with branches
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ; Description
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-;
+; -In current implementation, to comply with 50ns CAN controller's IPT of /SS,
+;  change of pin state is initiated a few instrucitons before writing data to
+;  the SPI buffer - may be better in the future to replace with a precise timer
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ;*******************************************************************************
 
@@ -235,8 +244,8 @@ can_ctrlr_init			    ; Configure CAN Controller for 500kbps, 40m bus and 69% NBT
     movlw   0x32		    
     movwf   CIRC_BUF_END	    ; update buffer start/end based on the first transaction (update start and end in SPI callback)
     movlw   0x30		    
-    movwf   SPI_CALLBACK_H	    ; Provide SPI_CALLBACK
-    movlw   0x2C
+    movwf   SPI_CALLBACK_H	    ; Provide SPI_CALLBACK at 0x3030
+    movlw   0x30
     movwf   SPI_CALLBACK_L
 
 ; First SERCOM transaction
@@ -327,7 +336,8 @@ can_spibufld_rxbuf		    ; Puts 13 bytes of dummy data into circular buffer
     movwf   CIRC_BUF_END
     movlw   0x30		    ; Load SPI_CALLBACK with program memory address of "can_read_rxbuf_cb"
     movwf   SPI_CALLBACK_H
-    clrf    SPI_CALLBACK_L
+    movlw   0x00
+    movwf   SPI_CALLBACK_L
     bsf	    VISR, 7		    ; Set VISR<7> to prevent other software interrupts from overwriting SPI SW buffer
     bcf	    LATB, 3		    ; Pull Slave Select line low (verify hold timing on oscilloscope, add timer interrupt if otherwise not working properly)
     movff   POSTINC1, SSP1BUF	    ; Initiate SPI transmission by loading the first SW buffer byte
@@ -366,7 +376,7 @@ can_action			    ; triggered when INT2 is pulled down by CAN controller
 ; SPI Callbacks
 ;***********************************************************
     
-    ORG	0x3000			    
+    ORG	    0x3000			    
 
 can_read_rxbuf_cb		    ; process data returned from the CAN RX Buffer n (0 | 1)
     movlw   0x04
@@ -393,8 +403,8 @@ can_read_rxbuf_cb_cont
     goto    main
     
     
-    ORG 0x302C
-    
+    ORG	    0x3030
+
 can_init_cb
     incf    CIRC_BUF_END, 0
     xorwf   FSR1L, 0
@@ -420,11 +430,72 @@ can_init_modechk
     goto    can_ctrlr_init	    ; if not, try reinitializing all over again
     bsf	    CAN_CTRL_INIT, 4	    ; if configuration succeeded, indicate in CAN INIT register
     bsf	    CAN_CTRL_INIT, 7	    ; then proceed to writing data to CAN controller in 'can_write_txbuf' func
-				    ; cleanup
-    movff   CIRC_BUF_START, CIRC_BUF_END    ; set buffer length to 0
+    bsf	    LATA, 0		    ; set RA0 to indicate CAN INIT completion
+    ; setup header data in data memory for each transmit message
+    movlw   0x37
+    movwf   CIRC_BUF_END	    ; set buffer length to 8 (1 instruction, 1 memory address, 1 CTRL register value, 4 ID bytes and 1 DLC)
+    movlw   0x30
+    movwf   SPI_CALLBACK_H	    ; provide SPI callback
+    movlw   0xA2
+    movwf   SPI_CALLBACK_L
+    lfsr    2, 0x100		    ; set FSR2 at the beginning of the dummy data bank 1
+    lfsr    1, 0x037		    ; fill up data memory addresses 0x30-0x37 with transmit message header data
+    movlw   0x08
+    movwf   POSTDEC1		    ; DLC = 8 bytes
+    clrf    POSTDEC1		    ; EXIDL unimplemented
+    clrf    POSTDEC1		    ; EXIDH unimplemented
+    movlw   0xA0
+    movwf   POSTDEC1		    ; EXIDE = 0 -> Standard Identifier used
+    movlw   0xAA		    ; load buffer with ID and DLC
+    movwf   POSTDEC1		    ; SID[10:0] = 0b10101010101
+    clrf    POSTDEC1		    ; TXBnCTRL: remove TXREQ flag bit, TXP[1:0] = 00 -> lowest priority
+    movlw   0x30
+    movwf   POSTDEC1		    ; Address of TXB0CTRL
+    bcf	    LATB, 3		    ; notify Slave of an incoming message
+    clrf    COUNTER		    ; clear counter (to count off 8 data bytes of FSR2)
+    movff   CAN_WR, INDF1	    ; WRITE instruction
+    movff   POSTINC1, SSP1BUF	    ; load first byte into SPI buffer, initiate SERCOM transaction
+    goto    main
+    
+    
+    ORG	    0x30A2
+    
+can_write_txbuf_cb
+    incf    CIRC_BUF_END, 0
+    xorwf   FSR1L, 0
+    bz	    can_write_txbuf_data    ; check if FSR1 reached the end of buffer for current transaction
+    movff   POSTINC1, SSP1BUF	    ; if not, send next byte
+    goto    main
 
-can_write_txbuf
-    ; write logic for writing data to CAN controller
+can_write_txbuf_data
+    movlw   0x30		    
+    movwf   SPI_CALLBACK_H	    ; update SPI callback with ..._data_cb
+    movlw   0xC4
+    movwf   SPI_CALLBACK_L
+    movff   POSTINC2, SSP1BUF	    ; send the first data byte to TX buffer
+    incf    COUNTER, 1		    ; increment number of sent data bytes
+    goto    main		    ; return to main
+    
+    
+    ORG	    0x30C4
+    
+can_write_txbuf_data_cb
+    movlw   0x08
+    xorwf   COUNTER, 0		    ; check if all 8 data bytes were written to TX buffer
+    bz	    can_write_txbuf_msg_fin
+    incf    COUNTER, 1		    ; increment the number of already sent data bytes
+    movlw   0x02
+    xorwf   FSR2H, 0		    ; check if FSR2 looped to the end of bank 1
+    btfsc   STATUS, 2		    ; Z bit of STATUS register is 1 in this case
+    lfsr    2, 0x100		    ; set FSR2 back to the beginning of bank 1 (circular buffer style)
+    movff   POSTINC2, SSP1BUF	    ; send next data byte
+    goto    main		    ; return to main
+    
+can_write_txbuf_msg_fin
+    bsf	    LATB, 3		    ; release Slave
+    bcf	    LATB, 5		    ; pull low the TX Buffer 0 RTS pin to start CAN transmission
+    bcf	    VISR, 7		    ; indicate end of SERCOM transaction, wait for Transmit Completed message form CAN
+    goto    main
     
 ;***********************************************************
 ; Interrupts
