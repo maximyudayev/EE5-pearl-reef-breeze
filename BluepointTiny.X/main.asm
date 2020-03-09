@@ -13,6 +13,11 @@
 ;						  *correct CAN controller setup
 ;						  *correct TX buffer loading and
 ;						   request to send
+;			09/03/2020		  *correct reaction to INT2,
+;						   CAN controller interrupt flag
+;						   clearing, interrupt reaction
+;						   queuing and buffer reloading
+;						   on successful transmission
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ; TODO			Date        Finished	Comment
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -26,12 +31,21 @@
 ;  program creation to
 ;  minmize jumps and to
 ;  replace with branches
+; -Add CAN interrupt	09/03/2020  09/03/2020	-On SPI transaction completion,
+;  queue to avoid				 if there are still uncleared
+;  deadlocks					 flags in VCANINT, program takes
+;						 care of all other interrupt
+;						 sources separately
+; -Verify proper	09/03/2020
+;  real-life working
+;  using logic analyzer
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ; Description
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ; -In current implementation, to comply with 50ns CAN controller's IPT of /SS,
 ;  change of pin state is initiated a few instrucitons before writing data to
-;  the SPI buffer - may be better in the future to replace with a precise timer
+;  the SPI buffer - may be better in the future to replace with a precise timer,
+;  but the current workaround is deemed sufficient
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ;*******************************************************************************
 
@@ -61,7 +75,18 @@ CAN_RTS_2	    equ 0x0F
 CAN_RD_ST	    equ 0x10
 CAN_RX_ST	    equ 0x11
 CAN_BM		    equ 0x12
-COUNTER		    equ 0x20
+VWREG		    equ	0x15
+VCANINT		    equ	0x16
+VEFLG		    equ 0x17		    
+VISR		    equ 0x20	; Virtual Interrupt Service Register
+				; bit 7 - carrying out SERCOM transaction, do not touch my data buffer yet
+				; bit 6 -
+				; bit 5 - one of CAN internal interrupts, check VCANINT and VEFLG for details
+				; bit 4 - TMR0 interrupt, MCU waited for 8.3us to allow CAN controller start-up
+				; bit 3 - IOCC2 interrupt, RX1BF changed pin state (SW reacts only on falling edge)
+				; bit 2 - IOCC1 interrupt, RX0BF changed pin state (SW reacts only on falling edge)
+				; bit 1 - INT2 interrupt, CAN controller has data
+				; bit 0 - SPI interrupt, byte sent
 CAN_CTRL_INIT	    equ 0x21	; CAN Controller Init Status Register
 				; bit 7 - Ready
 				; bit 6 - 
@@ -71,19 +96,13 @@ CAN_CTRL_INIT	    equ 0x21	; CAN Controller Init Status Register
 				; bit 2 - Rx/Tx pins configured
 				; bit 1 - RXB1CTRL configured
 				; bit 0 - RXB0CTRL configured
-VISR		    equ 0x22	; Virtual Interrupt Service Register
-				; bit 7 - carrying out SERCOM transaction, do not touch my data buffer yet
-				; bit 6 -
-				; bit 5 -
-				; bit 4 - TMR0 interrupt, MCU waited for 8.3us to allow CAN controller start-up
-				; bit 3 - IOCC2 interrupt, RX1BF changed pin state (SW reacts only on falling edge)
-				; bit 2 - IOCC1 interrupt, RX0BF changed pin state (SW reacts only on falling edge)
-				; bit 1 - INT2 interrupt, CAN controller has data
-				; bit 0 - SPI interrupt, byte sent
-SPI_CALLBACK_L	    equ 0x23	; Program memory address for SPI callback function
-SPI_CALLBACK_H	    equ 0x24
+COUNTER		    equ 0x22
+SPI_CALLBACK_H	    equ 0x23	; Program memory address for SPI callback function
+SPI_CALLBACK_L	    equ 0x24
 CIRC_BUF_START	    equ 0x25	; Start of SPI buffer (static)
 CIRC_BUF_END	    equ 0x26	; End of SPI buffer (dynamic, based on current action) 
+BIT_MOD_CALLBACK_H  equ 0x27	; Program memory address for BIT MODIFY callback function
+BIT_MOD_CALLBACK_L  equ 0x28
 	    
 ;***********************************************************
 ; Reset Vector
@@ -149,7 +168,12 @@ save_instructions
     clrf    VISR		    ; Virtual Interrupt Service Register
     clrf    SPI_CALLBACK_L	    ; contains PC address of the routine to carry out on SPI transactions
     clrf    SPI_CALLBACK_H
+    clrf    BIT_MOD_CALLBACK_H
+    clrf    BIT_MOD_CALLBACK_L
     clrf    CAN_CTRL_INIT
+    clrf    VWREG
+    clrf    VCANINT
+    clrf    VEFLG
     clrf    COUNTER		    ; counter is used to generate fake data
     movlw   0x30
     movwf   CIRC_BUF_START	    ; Circular Buffer starts at 0x20
@@ -243,9 +267,9 @@ can_ctrlr_init			    ; Configure CAN Controller for 500kbps, 40m bus and 69% NBT
     movwf   INDF2		    ; stop FSR2L at the location 0x027. It now spans cells 0x027-0x02A
     movlw   0x32		    
     movwf   CIRC_BUF_END	    ; update buffer start/end based on the first transaction (update start and end in SPI callback)
-    movlw   0x30		    
-    movwf   SPI_CALLBACK_H	    ; Provide SPI_CALLBACK at 0x3030
-    movlw   0x30
+    movlw   0x31		    
+    movwf   SPI_CALLBACK_H	    ; Provide SPI_CALLBACK at 0x3100
+    movlw   0x00
     movwf   SPI_CALLBACK_L
 
 ; First SERCOM transaction
@@ -266,16 +290,16 @@ can_ctrlr_init			    ; Configure CAN Controller for 500kbps, 40m bus and 69% NBT
     movff   CAN_WR, POSTINC1	    ; WRITE instruction
     movlw   0x28
     movwf   POSTINC1		    ; CNF3 address
-    movlw   0x03		    ; CNF3 (0x28): PHSEG2 is 4Tq, wake-up filter disabled
-    movwf   POSTINC1
-    movlw   0xDE		    ; CNF2 (0x29): Bus sampled 3 times at sample point, PHSEG1 is 4Tq, PRSEG is 7Tq
-    movwf   POSTINC1
-    movlw   0xC0		    ; CNF1 (0x2A): Sync Jump Width of 4Tq, Baud Rate prescaler of 0
-    movwf   POSTINC1
-    movlw   0x3F		    ; CANINTE (0x2B): Enable interrupts on buffer transmission completion, receiver buffer full and bus errors from EFLG register
-    movwf   POSTINC1
-    movlw   0x00		    ; CANINTF (0x2C): Clear all interrupt flags
-    movwf   POSTINC1
+    movlw   0x03		    
+    movwf   POSTINC1		    ; CNF3 (0x28): PHSEG2 is 4Tq, wake-up filter disabled
+    movlw   0xDE		    
+    movwf   POSTINC1		    ; CNF2 (0x29): Bus sampled 3 times at sample point, PHSEG1 is 4Tq, PRSEG is 7Tq
+    movlw   0xC0		    
+    movwf   POSTINC1		    ; CNF1 (0x2A): Sync Jump Width of 4Tq, Baud Rate prescaler of 0
+    movlw   0x3F		    
+    movwf   POSTINC1		    ; CANINTE (0x2B): Enable interrupts on buffer transmission completion, receiver buffer full and bus errors from EFLG register
+    movlw   0x00		    
+    movwf   POSTINC1		    ; CANINTF (0x2C): Clear all interrupt flags
 
 ; New SERCOM transaction
     movff   CAN_WR, POSTINC1	    ; WRITE instruction
@@ -308,10 +332,10 @@ main
 action
     btfsc   VISR, 0		    ; is SPI triggered?
     bra	    spi_action
-    btfsc   VISR, 1		    ; is INT2 triggered?
-    bra	    can_action		    
     btfsc   VISR, 7		    ; if serial transaction of data buffer is in progress, wait for completion
     bra	    main		    
+    btfsc   VISR, 1		    ; is INT2 triggered?
+    bra	    can_action		    
     btfsc   VISR, 4		    ; is TMR0 triggered?
     bra	    can_startup_action	    ; if none of the above, then go to ioc_action
     
@@ -368,9 +392,18 @@ can_startup_action		    ; triggered when TMR0 count 8.3us indicating end of CAN 
     bra	    can_ctrlr_init
     
 can_action			    ; triggered when INT2 is pulled down by CAN controller
-    ; check the source of interrupt
-    ; process the trigger and check current MCU state
-    ; add corresponding logic for multiple cases (i.e failed transaction, succes, etc)
+    bsf	    VISR, 7		    ; indicate start of SERCOM transaction
+    bcf	    VISR, 1		    ; remove software flag for external INT2
+    lfsr    1, 0x038		    ; set FSR1 at the start of interrupt source checking bytes
+    bcf	    LATB, 3		    ; pull /SS line low, notify Slave
+    movlw   0x34
+    movwf   SPI_CALLBACK_H	    ; provide SPI callback
+    movlw   0x00
+    movwf   SPI_CALLBACK_L
+    movlw   0x3A
+    movwf   CIRC_BUF_END	    ; set end of buffer to be the end of SPI transmission when CANINTF is received 
+    movff   POSTINC1, SSP1BUF	    ; initiate SPI transmission
+    goto    main
     
 ;***********************************************************
 ; SPI Callbacks
@@ -403,7 +436,7 @@ can_read_rxbuf_cb_cont
     goto    main
     
     
-    ORG	    0x3030
+    ORG	    0x3100
 
 can_init_cb
     incf    CIRC_BUF_END, 0
@@ -431,34 +464,53 @@ can_init_modechk
     bsf	    CAN_CTRL_INIT, 4	    ; if configuration succeeded, indicate in CAN INIT register
     bsf	    CAN_CTRL_INIT, 7	    ; then proceed to writing data to CAN controller in 'can_write_txbuf' func
     bsf	    LATA, 0		    ; set RA0 to indicate CAN INIT completion
-    ; setup header data in data memory for each transmit message
-    movlw   0x37
-    movwf   CIRC_BUF_END	    ; set buffer length to 8 (1 instruction, 1 memory address, 1 CTRL register value, 4 ID bytes and 1 DLC)
-    movlw   0x30
-    movwf   SPI_CALLBACK_H	    ; provide SPI callback
-    movlw   0xA2
-    movwf   SPI_CALLBACK_L
+
+; setup header data in data memory for each transmit message
     lfsr    2, 0x100		    ; set FSR2 at the beginning of the dummy data bank 1
-    lfsr    1, 0x037		    ; fill up data memory addresses 0x30-0x37 with transmit message header data
-    movlw   0x08
-    movwf   POSTDEC1		    ; DLC = 8 bytes
-    clrf    POSTDEC1		    ; EXIDL unimplemented
-    clrf    POSTDEC1		    ; EXIDH unimplemented
-    movlw   0xA0
-    movwf   POSTDEC1		    ; EXIDE = 0 -> Standard Identifier used
-    movlw   0xAA		    ; load buffer with ID and DLC
-    movwf   POSTDEC1		    ; SID[10:0] = 0b10101010101
-    clrf    POSTDEC1		    ; TXBnCTRL: remove TXREQ flag bit, TXP[1:0] = 00 -> lowest priority
+    lfsr    1, 0x030		    ; fill up data memory addresses 0x30-0x37 with transmit message header data
+    movff   CAN_WR, POSTINC1	    ; WRITE instruction
     movlw   0x30
-    movwf   POSTDEC1		    ; Address of TXB0CTRL
+    movwf   POSTINC1		    ; Address of TXB0CTRL
+    clrf    POSTINC1		    ; TXBnCTRL: remove TXREQ flag bit, TXP[1:0] = 00 -> lowest priority
+    movlw   0xAA		    ; load buffer with ID and DLC
+    movwf   POSTINC1		    ; SID[10:0] = 0b10101010101
+    movlw   0xA0
+    movwf   POSTINC1		    ; EXIDE = 0 -> Standard Identifier used
+    clrf    POSTINC1		    ; EXIDL unimplemented
+    clrf    POSTINC1		    ; EXIDH unimplemented
+    movlw   0x08
+    movwf   POSTINC1		    ; DLC = 8 bytes
+; fill up 0x38-0x3B with interrupt source checking bytes
+    movff   CAN_RD, POSTINC1	    ; READ instruction
+    movlw   0x2C
+    movwf   POSTINC1		    ; address of CANINTF
+    clrf    POSTINC1		    ; do not care data for CANINTF
+    clrf    POSTINC1		    ; do not care data for EFGL
+; fill up 0x3C-0x3F with interrupt source checking bytes    
+    movff   CAN_BM, POSTINC1	    ; BIT MODIFY instruction
+    movlw   0x2C
+    movwf   POSTINC1		    ; address of CANINTF
+    movlw   0x04		    ; mask byte: initially allows only TX0IF to be changed
+    movwf   POSTINC1		    ; it is allowed to update it during program operation
+    movlw   0x00		    ; data byte: clears all masked bits
+    movwf   POSTINC1		    ; it is allowed to update it during program operation
+; continue immediately to "can_write_txbuf" to start transmission of messages
+    
+can_write_txbuf
+    lfsr    1, 0x030
     bcf	    LATB, 3		    ; notify Slave of an incoming message
     clrf    COUNTER		    ; clear counter (to count off 8 data bytes of FSR2)
-    movff   CAN_WR, INDF1	    ; WRITE instruction
+    movlw   0x37
+    movwf   CIRC_BUF_END	    ; set buffer length to 8 (1 instruction, 1 memory address, 1 CTRL register value, 4 ID bytes and 1 DLC)
+    movlw   0x32
+    movwf   SPI_CALLBACK_H	    ; provide SPI callback
+    movlw   0x00
+    movwf   SPI_CALLBACK_L
     movff   POSTINC1, SSP1BUF	    ; load first byte into SPI buffer, initiate SERCOM transaction
     goto    main
     
     
-    ORG	    0x30A2
+    ORG	    0x3200
     
 can_write_txbuf_cb
     incf    CIRC_BUF_END, 0
@@ -468,16 +520,16 @@ can_write_txbuf_cb
     goto    main
 
 can_write_txbuf_data
-    movlw   0x30		    
+    movlw   0x33		    
     movwf   SPI_CALLBACK_H	    ; update SPI callback with ..._data_cb
-    movlw   0xC4
+    movlw   0x00
     movwf   SPI_CALLBACK_L
     movff   POSTINC2, SSP1BUF	    ; send the first data byte to TX buffer
     incf    COUNTER, 1		    ; increment number of sent data bytes
     goto    main		    ; return to main
     
     
-    ORG	    0x30C4
+    ORG	    0x3300
     
 can_write_txbuf_data_cb
     movlw   0x08
@@ -492,10 +544,138 @@ can_write_txbuf_data_cb
     goto    main		    ; return to main
     
 can_write_txbuf_msg_fin
-    bsf	    LATB, 3		    ; release Slave
+    bsf	    LATB, 3		    ; release Slave to indicate end of SPI command
     bcf	    LATB, 5		    ; pull low the TX Buffer 0 RTS pin to start CAN transmission
-    bcf	    VISR, 7		    ; indicate end of SERCOM transaction, wait for Transmit Completed message form CAN
+    movf    VCANINT, 0
+    bnz	    can_isr_src_list	    ; if there is a queue of other interrupts, treat them
+    bcf	    VISR, 7		    ; else, indicate end of SERCOM transaction, wait for Transmit Completed message from CAN
     goto    main
+    
+    
+    ORG	    0x3400
+
+can_isr_src_cb
+    incf    CIRC_BUF_END, 0
+    xorwf   FSR1L, 0
+    bz	    can_isr_src_msg_fin
+    movff   POSTINC1, SSP1BUF
+    goto    main
+    
+can_isr_src_msg_fin		    
+    movlw   0x3B
+    xorwf   FSR1L, 0		    ; transition between CANINTF and EFLG?
+    bnz	    can_isr_src_tst	    ; if not, branch
+    movff   SSP1BUF, VCANINT	    ; else, save value of CANINTF
+    btfsc   VCANINT, 5		    ; and check if EFLG also triggered interrupt
+    bra	    can_isr_src_chkeflg	    ; if so, send another byte and record EFLG value to VEFLG
+				    ; else, stop transaction and continue to BIT MODIFY logic
+
+can_isr_src_tst
+    bsf	    LATB, 3		    ; release Slave to indicate end of SPI instruction
+can_isr_src_list    
+    movf    VCANINT, 0
+    andlw   0x20		    ; was EFLG one of interrupt sources?
+    bnz	    can_isr_src_eflg	    ; if EFLG is one of sources, branch
+    btfsc   VCANINT, 2		    ; else test other sources in VCANINT
+    bra	    can_isr_tx0_success	     
+    btfsc   VCANINT, 3
+    bra	    can_isr_tx1_success	    
+    btfsc   VCANINT, 4
+    bra	    can_isr_tx2_success
+    btfsc   VCANINT, 0
+    bra	    can_isr_rx0_rcvd	    
+    btfsc   VCANINT, 1
+    bra	    can_isr_rx1_rcvd
+    ; should always trigger one of the above conditions. Each function affects corresponding mask and data bit
+
+can_isr_src_chkeflg
+    movlw   0x3B
+    movwf   CIRC_BUF_END	    ; extend buffer length by 1 more byte
+    movff   POSTINC1, SSP1BUF	    ; send dummy data in exchange for EFLG value
+    goto    main
+    
+can_isr_tx0_success		    
+    bsf	    LATB, 5		    ; pull high TX0RTS line
+    movlw   0x04
+    movwf   0x3E		    ; apply mask for TX0IF
+    movlw   0x00
+    movwf   0x3F		    ; clear masked flag
+    bcf	    VCANINT, 2		    ; clear virtual CANINT.TX0IF flag
+    bra	    can_isr_tx_set_bm_cb
+    
+can_isr_tx1_success
+    bsf	    LATB, 6		    ; pull high TX1RTS line
+    movlw   0x08
+    movwf   0x3E		    ; apply mask for TX1IF
+    movlw   0x00
+    movwf   0x3F		    ; clear masked flag
+    bcf	    VCANINT, 3		    ; clear virtual CANINT.TX1IF flag
+    bra	    can_isr_tx_set_bm_cb
+    
+can_isr_tx2_success
+    bsf	    LATB, 7		    ; pull high TX2RTS line
+    movlw   0x10
+    movwf   0x3E		    ; apply mask for TX2IF
+    movlw   0x00
+    movwf   0x3F		    ; clear masked flag
+    bcf	    VCANINT, 4		    ; clear virtual CANINT.TX2IF flag
+    
+can_isr_tx_set_bm_cb
+    movlw   0x36
+    movwf   BIT_MOD_CALLBACK_H
+    movlw   0x00
+    movwf   BIT_MOD_CALLBACK_L
+    bra	    can_isr_bit_mod
+    
+can_isr_rx0_rcvd		    ; in receive registers, check for overflow indicated by EFLG
+    ; complete logic
+    
+can_isr_rx1_rcvd
+    ; complete logic
+    
+can_isr_src_eflg		    ; check the source of interrupt, update mask and data. bit modify func will do everything else
+    movff   SSP1BUF, VEFLG	    ; save EFLG value to VEFLG
+    ; complete logic
+    
+can_isr_bit_mod			    ; one of functions above updated mask and data values, use them to modify the registers
+    lfsr    1, 0x3C		    ; carried out separately on each source to avoid double interrupt counting as single if previous not yet resolved from software queue
+    movlw   0x3F
+    movwf   CIRC_BUF_END	    ; update buffer end with end of BIT MODIFY transaction
+    bcf	    LATB, 3		    ; notify Slave of incoming SPI message
+    movlw   0x35
+    movwf   SPI_CALLBACK_H	    ; update SPI callback
+    movlw   0x00
+    movwf   SPI_CALLBACK_L
+    bsf	    VISR, 7		    ; set SERCOM transaction flag
+    movff   POSTINC1, SSP1BUF	    ; send first SPI data byte
+    goto    main
+    
+    
+    ORG	    0x3500
+    
+can_isr_bit_mod_cb
+    incf    CIRC_BUF_END, 0
+    xorwf   FSR1L, 0
+    bz	    can_isr_bit_mod_fin	    ; continue sending next byte until 4 total bytes are sent 0x3C-0x3F
+    movff   POSTINC1, SSP1BUF
+    goto    main
+    
+can_isr_bit_mod_fin
+    bsf	    LATB, 3		    ; notify Slave of the end of SPI command
+    clrf    PCLATU		    ; update the PC with location of callback function
+    movff   BIT_MOD_CALLBACK_H, PCLATH
+    movf    BIT_MOD_CALLBACK_L, 0
+    movwf   PCL			    ; after this instruciton, program should jump to appropriate callback
+    
+    
+    ORG	    0x3600
+    
+can_tx_bit_mod_cb		    ; BIT MODIFY instruction cleared the TXnIF, now load that buffer
+    rlncf   0x3E, 0		    ; load to WREG and shift left the bit mask (contains index of TX buffer whose interrupt was just cleared)
+    andlw   0xF0		    ; keep the first neeble only
+    addlw   0x30		    ; add with 0b00110000 offset to get TXBnCTRL register address
+    movwf   0x31		    ; load WREG value to the Transmit Buffer X register to write to this, now ready, transmit buffer
+    bra	    can_write_txbuf	    ; invoke write function to this ready TX buffer
     
 ;***********************************************************
 ; Interrupts
@@ -503,24 +683,24 @@ can_write_txbuf_msg_fin
 	     
 inter_high
     btfsc   PIR1, 3
-    call    spi_interrupt
+    bra	    spi_interrupt
     btfsc   INTCON3, 1
-    call    can_interrupt
+    bra	    can_interrupt
     btfsc   INTCON, 0
-    call    ioc_interrupt
+    bra	    ioc_interrupt
     btfsc   INTCON, 2
-    call    tmr0_interrupt
+    bra	    tmr0_interrupt
     retfie
     
 spi_interrupt
     bsf	    VISR, 0		    ; set corresponding software flag
     bcf	    PIR1, 3		    ; remove hardware flag
-    return
+    retfie
     
 can_interrupt
     bsf	    VISR, 1		    ; set corresponding software flag
     bcf	    INTCON3, 1		    ; remove hardware flag
-    return
+    retfie
 
 ioc_interrupt
     btfss   PORTC, 1
@@ -528,13 +708,13 @@ ioc_interrupt
     btfss   PORTC, 6		    
     bsf	    VISR, 3		    ; set corresponding software flag
     bcf	    INTCON, 0		    ; remove hardware flag
-    return
+    retfie
     
 tmr0_interrupt
     bsf	    VISR, 4		    ; set corresponding software flag
     bcf	    INTCON, 5		    ; disable TMR0 interrupt
     bcf	    INTCON, 2		    ; remove hardware flag
-    return
+    retfie
     
 inter_low
     nop
