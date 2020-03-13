@@ -13,7 +13,7 @@
 ;						  *correct CAN controller setup
 ;						  *correct TX buffer loading and
 ;						   request to send
-;			09/03/2020		  *correct reaction to INT2,
+;			09/03/2020  0.2		  *correct reaction to INT2,
 ;						   CAN controller interrupt flag
 ;						   clearing, interrupt reaction
 ;						   queuing and buffer reloading
@@ -21,16 +21,6 @@
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ; TODO			Date        Finished	Comment
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-; -Add #define driven	08/03/2020  
-;  masks/filters and
-;  transmit priorities
-;  for use by SolarTeam
-;  as API
-; -Adjust ORGs at the	08/03/2020
-;  completion of
-;  program creation to
-;  minmize jumps and to
-;  replace with branches
 ; -Add CAN interrupt	09/03/2020  09/03/2020	-On SPI transaction completion,
 ;  queue to avoid				 if there are still uncleared
 ;  deadlocks					 flags in VCANINT, program takes
@@ -46,16 +36,96 @@
 ;  change of pin state is initiated a few instrucitons before writing data to
 ;  the SPI buffer - may be better in the future to replace with a precise timer,
 ;  but the current workaround is deemed sufficient
+; -SPI operates in 0, 0 Mode
+; -Optional /TRxRTS pins are configured
 ; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+; Future Improvements
+; ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+; 1. SW configurable driven transmit priority
+; 2. SW configurable receive masks/filters
+; 3. SW configurable interrupt sources/events
+; 4. Slave Select pin time-off for accurate 50ns IPT delay after IOC indicates
+;    change of pin state
+; 5. Self calibration to the unknown timing of the CAN bus (saving successful
+;    calibration time quanta and configs to EEPROM) - selectable in SW for PIC18F
+; 6. Higher level caller function to transmit real data
+; 7. Indication in SW of filter match, rollover, priority, bus errors, etc.
 ;*******************************************************************************
 
 ;***********************************************************
 ; File Header
 ;***********************************************************
     
-    list p=18F25k50, r=hex, n=0
-    #include <p18f25k50.inc>
-    
+; PIC18F25K50 Configuration Bit Settings
+; Assembly source line config statements
+#include "p18f25k50.inc"
+
+; CONFIG1L
+  CONFIG  PLLSEL = PLL4X        ; PLL Selection (4x clock multiplier)
+  CONFIG  CFGPLLEN = OFF	; PLL Enable Configuration bit (PLL Disabled (firmware controlled))
+  CONFIG  CPUDIV = NOCLKDIV     ; CPU System Clock Postscaler (CPU uses system clock (no divide))
+  CONFIG  LS48MHZ = SYS24X4     ; Low Speed USB mode with 48 MHz system clock (System clock at 24 MHz, USB clock divider is set to 4)
+
+; CONFIG1H
+  CONFIG  FOSC = ECHIO		; Oscillator Selection (EC oscillator, high power 16MHz to 48MHz)
+  CONFIG  PCLKEN = ON           ; Primary Oscillator Shutdown (Primary oscillator enabled)
+  CONFIG  FCMEN = OFF           ; Fail-Safe Clock Monitor (Fail-Safe Clock Monitor disabled)
+  CONFIG  IESO = OFF            ; Internal/External Oscillator Switchover (Oscillator Switchover mode disabled)
+
+; CONFIG2L
+  CONFIG  nPWRTEN = OFF         ; Power-up Timer Enable (Power up timer disabled)
+  CONFIG  BOREN = SBORDIS       ; Brown-out Reset Enable (BOR enabled in hardware (SBOREN is ignored))
+  CONFIG  BORV = 190            ; Brown-out Reset Voltage (BOR set to 1.9V nominal)
+  CONFIG  nLPBOR = OFF          ; Low-Power Brown-out Reset (Low-Power Brown-out Reset disabled)
+
+; CONFIG2H
+  CONFIG  WDTEN = OFF           ; Watchdog Timer Enable bits (WDT enabled in hardware (SWDTEN ignored))
+  CONFIG  WDTPS = 32768         ; Watchdog Timer Postscaler (1:32768)
+
+; CONFIG3H
+  CONFIG  CCP2MX = RC1          ; CCP2 MUX bit (CCP2 input/output is multiplexed with RC1)
+  CONFIG  PBADEN = OFF          ; PORTB A/D Enable bit (PORTB<5:0> pins are configured as analog input channels on Reset)
+  CONFIG  T3CMX = RC0           ; Timer3 Clock Input MUX bit (T3CKI function is on RC0)
+  CONFIG  SDOMX = RC7		; SDO Output MUX bit (SDO function is on RB3)
+  CONFIG  MCLRE = ON            ; Master Clear Reset Pin Enable (MCLR pin enabled; RE3 input disabled)
+
+; CONFIG4L
+  CONFIG  STVREN = ON           ; Stack Full/Underflow Reset (Stack full/underflow will cause Reset)
+  CONFIG  LVP = ON              ; Single-Supply ICSP Enable bit (Single-Supply ICSP enabled if MCLRE is also 1)
+  CONFIG  ICPRT = OFF           ; Dedicated In-Circuit Debug/Programming Port Enable (ICPORT disabled)
+  CONFIG  XINST = OFF           ; Extended Instruction Set Enable bit (Instruction set extension and Indexed Addressing mode disabled)
+  CONFIG  DEBUG = ON		; In-Circuit Debugging using PICKit3
+  
+; CONFIG5L
+  CONFIG  CP0 = OFF             ; Block 0 Code Protect (Block 0 is not code-protected)
+  CONFIG  CP1 = OFF             ; Block 1 Code Protect (Block 1 is not code-protected)
+  CONFIG  CP2 = OFF             ; Block 2 Code Protect (Block 2 is not code-protected)
+  CONFIG  CP3 = OFF             ; Block 3 Code Protect (Block 3 is not code-protected)
+
+; CONFIG5H
+  CONFIG  CPB = OFF             ; Boot Block Code Protect (Boot block is not code-protected)
+  CONFIG  CPD = OFF             ; Data EEPROM Code Protect (Data EEPROM is not code-protected)
+
+; CONFIG6L
+  CONFIG  WRT0 = OFF            ; Block 0 Write Protect (Block 0 (0800-1FFFh) is not write-protected)
+  CONFIG  WRT1 = OFF            ; Block 1 Write Protect (Block 1 (2000-3FFFh) is not write-protected)
+  CONFIG  WRT2 = OFF            ; Block 2 Write Protect (Block 2 (04000-5FFFh) is not write-protected)
+  CONFIG  WRT3 = OFF            ; Block 3 Write Protect (Block 3 (06000-7FFFh) is not write-protected)
+
+; CONFIG6H
+  CONFIG  WRTC = OFF            ; Configuration Registers Write Protect (Configuration registers (300000-3000FFh) are not write-protected)
+  CONFIG  WRTB = OFF            ; Boot Block Write Protect (Boot block (0000-7FFh) is not write-protected)
+  CONFIG  WRTD = OFF            ; Data EEPROM Write Protect (Data EEPROM is not write-protected)
+
+; CONFIG7L
+  CONFIG  EBTR0 = OFF           ; Block 0 Table Read Protect (Block 0 is not protected from table reads executed in other blocks)
+  CONFIG  EBTR1 = OFF           ; Block 1 Table Read Protect (Block 1 is not protected from table reads executed in other blocks)
+  CONFIG  EBTR2 = OFF           ; Block 2 Table Read Protect (Block 2 is not protected from table reads executed in other blocks)
+  CONFIG  EBTR3 = OFF           ; Block 3 Table Read Protect (Block 3 is not protected from table reads executed in other blocks)
+
+; CONFIG7H
+  CONFIG  EBTRB = OFF           ; Boot Block Table Read Protect (Boot block is not protected from table reads executed in other blocks)
+
 CAN_RST		    equ 0x00
 CAN_RD		    equ 0x01
 CAN_RD_RX_BUF_0H    equ 0x02
@@ -182,7 +252,7 @@ save_instructions
 config_hw
     movlw   0x80		    ; 3xPLL
     movwf   OSCTUNE		
-    movlw   0x72		    ; HFINTOSC 16MHz, Sleep mode when issued SLEEP
+    movlw   0x70		    ; HFINTOSC 16MHz, Sleep mode when issued SLEEP
     movwf   OSCCON		
     movlw   0x10		    ; PLLEN
     movwf   OSCCON2
@@ -205,13 +275,13 @@ config_hw
     
     clrf    LATC
     clrf    ANSELC
-    movlw   0x42		    ; RC1 and RC6 inputs for RXnBF interrupt	       
+    movlw   0x00		    ; RC1 and RC6 inputs for RXnBF interrupt	       
     movwf   TRISC
     
     movlw   0x00
     movwf   SSP1STAT
-    movlw   0x21
-    movwf   SSP1CON1		    ; Fosc/16 as SPI clock source
+    movlw   0x22
+    movwf   SSP1CON1		    ; Fosc/64 as SPI clock source
     movlw   0x10
     movwf   SSP1CON3
     
@@ -220,7 +290,7 @@ config_hw
     movwf   T0CON		    ; configure TMR0 as 120kHz (8.3us): 8bit, PS1:1, 156 offset, do not start yet
     movlw   0x9C
     movwf   TMR0L		    
-    movlw   0x04
+    movlw   0x14
     movwf   INTCON2		    ; TMR0 interrupt high priority
     movlw   0x20
     movwf   INTCON		    ; enable TMR0 interrupt, do not enable global interrupt yet
@@ -305,8 +375,8 @@ can_ctrlr_init			    ; Configure CAN Controller for 500kbps, 40m bus and 69% NBT
     movff   CAN_WR, POSTINC1	    ; WRITE instruction
     movlw   0x0C
     movwf   POSTINC1		    ; BFPCTRL address
-    movlw   0x0F			    
-    movwf   POSTINC1		    ; BFPCTRL (0x0C) - configures /RXnBF to trigger interrupt on buffer full
+    movlw   0x00			    
+    movwf   POSTINC1		    ; BFPCTRL (0x0C) - disables /RXnBF not to trigger interrupt on buffer full
     movlw   0x07			    
     movwf   POSTINC1		    ; TXRTSCTRL (0x0D)- configures /TXnRTS to trigger transmission on falling edge
     movlw   0x00			    
@@ -377,14 +447,14 @@ spi_action			    ; triggered when SPI transmission of 1 byte is finished, invoke
 can_startup_action		    ; triggered when TMR0 count 8.3us indicating end of CAN oscillator startup time
     clrf    T0CON		    ; turn off TMR0
     bcf	    VISR, 4		    ; remove software flag
-    movlw   0x58		    ; configure interrupts for normal operation
+    movlw   0x40		    ; configure interrupts for normal operation
     movwf   INTCON		    ; enable external interrupt and interrupt on pin change, enable interrupts from peripherals
-    movlw   0xE8
+    movlw   0xE0
     movwf   INTCON2		    ; enable external INT2 on falling edge
     movlw   0x90
     movwf   INTCON3		    ; enable external INT2
-    movlw   0x42		    
-    movwf   IOCC		    ; enable on pin change on pin RC1 and RC6
+;    movlw   0x42		    
+;    movwf   IOCC		    ; enable on pin change on pin RC1 and RC6
     movlw   0x08
     movwf   PIE1		    ; interupt enable SPI
     clrf    PIR1		    ; clear interrupt flags
@@ -456,14 +526,17 @@ can_init_msg_fin
     movff   POSTINC1, SSP1BUF	    ; initiate the next transaction
     goto    main
 
+can_init_modechk_fail
+    btg	    PORTC, 2
+    goto    can_ctrlr_init	    ; if not, try reinitializing all over again
+    
 can_init_modechk
     movf    SSP1BUF, 0		    
-    xorlw   0xE0		    ; mask CANSTAT with 0b11100000 to get only OPMOD[2:0] bits   
-    btfss   STATUS, 2		    ; verify that CANSTAT matches expected value of Normal mode
-    goto    can_ctrlr_init	    ; if not, try reinitializing all over again
+    movwf   LATA
+    andlw   0xE0		    ; mask CANSTAT with 0b11100000 to get only OPMOD[2:0] bits   
+    bnz	    can_init_modechk_fail   ; verify that CANSTAT matches expected value of Normal mode
     bsf	    CAN_CTRL_INIT, 4	    ; if configuration succeeded, indicate in CAN INIT register
     bsf	    CAN_CTRL_INIT, 7	    ; then proceed to writing data to CAN controller in 'can_write_txbuf' func
-    bsf	    LATA, 0		    ; set RA0 to indicate CAN INIT completion
 
 ; setup header data in data memory for each transmit message
     lfsr    2, 0x100		    ; set FSR2 at the beginning of the dummy data bank 1
@@ -572,7 +645,7 @@ can_isr_src_msg_fin
 
 can_isr_src_tst
     bsf	    LATB, 3		    ; release Slave to indicate end of SPI instruction
-can_isr_src_list    
+can_isr_src_list		    ; TODO: implement callbacks for all interrupt sources
     movf    VCANINT, 0
     andlw   0x20		    ; was EFLG one of interrupt sources?
     bnz	    can_isr_src_eflg	    ; if EFLG is one of sources, branch
